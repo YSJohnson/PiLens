@@ -1,10 +1,12 @@
 /* global process, setTimeout, clearTimeout, fetch, WebSocket, console */
 import { spawn } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 
 const projectRoot = path.resolve(import.meta.dirname, '..')
 const outputDirectory = process.argv[2] ?? 'release'
 const executable = path.join(projectRoot, outputDirectory, 'win-unpacked', 'PiLens.exe')
+const expectedVersion = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8')).version
 const debugPort = 9333
 const child = spawn(executable, [`--remote-debugging-port=${debugPort}`, '--enable-logging=stderr'], {
   cwd: projectRoot,
@@ -83,6 +85,8 @@ try {
       ].every((name) => typeof window.piDesktop?.[name] === 'function')
       const authApiPresent = ['loginProvider', 'answerAuthPrompt', 'cancelProviderLogin', 'disconnectProvider']
         .every((name) => typeof window.piDesktop?.[name] === 'function')
+      const sessionLifecycleApiPresent = ['setSessionArchived', 'deleteSession']
+        .every((name) => typeof window.piDesktop?.[name] === 'function')
       const resources = resourceApiPresent ? await window.piDesktop.getResources() : null
       const changes = bootstrap?.snapshot?.changes ?? []
       const assistantMessages = (bootstrap?.snapshot?.messages ?? []).filter((message) => message.role === 'assistant')
@@ -92,6 +96,8 @@ try {
         bridgePresent,
         resourceApiPresent,
         authApiPresent,
+        sessionLifecycleApiPresent,
+        version: bootstrap?.version,
         demoMode: bootstrap?.demoMode,
         platform: bootstrap?.platform,
         providerCount: bootstrap?.providers?.length ?? 0,
@@ -132,6 +138,8 @@ try {
     || result?.bridgePresent !== true
     || result?.resourceApiPresent !== true
     || result?.authApiPresent !== true
+    || result?.sessionLifecycleApiPresent !== true
+    || result?.version !== expectedVersion
     || result?.demoMode !== false
     || result?.platform !== 'win32'
     || result?.providerCount < 1

@@ -36,6 +36,19 @@ describe('browser preview bridge', () => {
     unsubscribe()
   })
 
+  it('reports an asynchronous prompt failure with the original prompt id', async () => {
+    vi.useFakeTimers()
+    const bridge = createDemoBridge()
+    const events: DesktopEvent[] = []
+    const unsubscribe = bridge.onEvent((event) => events.push(event))
+
+    await bridge.sendPrompt('模拟失败 [demo-fail]', undefined, 'off', [], 'prompt-1')
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(events).toContainEqual({ type: 'prompt:failed', promptId: 'prompt-1', message: '无法连接模型服务，请检查网络后重试。' })
+    unsubscribe()
+  })
+
   it('reports compaction progress and returns the reduced context snapshot', async () => {
     const bridge = createDemoBridge()
     const before = (await bridge.bootstrap()).snapshot!

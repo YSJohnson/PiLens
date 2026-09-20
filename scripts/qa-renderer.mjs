@@ -7,6 +7,7 @@ import path from 'node:path'
 
 const targetUrl = process.argv[2] ?? 'http://127.0.0.1:5173/'
 const outputDirectory = path.resolve(process.argv[3] ?? path.join(os.tmpdir(), 'pi-desktop-renderer-qa'))
+const navigationOnly = process.argv.includes('--navigation-only')
 const debugPort = 9555
 const edgeCandidates = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -83,13 +84,17 @@ function assert(condition, message) {
   if (!condition) throw new Error(message)
 }
 
+function rgbTotal(value) {
+  return (value.match(/[\d.]+/g) ?? []).slice(0, 3).reduce((total, channel) => total + Number(channel), 0)
+}
+
 let browser
 let client
 let userDataDirectory
 const consoleIssues = []
 const screenshots = []
 
-try {
+qa: try {
   const edge = await firstExistingPath(edgeCandidates)
   userDataDirectory = await mkdtemp(path.join(os.tmpdir(), 'pi-desktop-edge-qa-'))
   await mkdir(outputDirectory, { recursive: true })
@@ -198,7 +203,6 @@ try {
     title: document.title,
     bodyText: document.body.innerText.slice(0, 300),
     frameworkOverlay: Boolean(document.querySelector('vite-error-overlay, #webpack-dev-server-client-overlay')),
-    compaction: document.querySelector('.compaction-status')?.textContent?.trim(),
     bodyFontSize: getComputedStyle(document.body).fontSize,
     messageFontSize: getComputedStyle(document.querySelector('.message-content-shell .markdown-content')).fontSize,
   })`)
@@ -206,8 +210,231 @@ try {
   assert(identity.url.startsWith(targetUrl), `Unexpected page URL: ${identity.url}`)
   assert(identity.bodyText.includes('PiLens') && identity.bodyText.length > 80, 'The first meaningful screen is blank.')
   assert(!identity.frameworkOverlay, 'A framework error overlay is visible.')
-  assert(identity.compaction?.includes('已压缩 1 次'), 'Compaction history is not visible in the inspector.')
   assert(Number.parseFloat(identity.messageFontSize) >= 16, `Conversation text is too small: ${identity.messageFontSize}`)
+  const navigation = await evaluate(`({
+    navigatorRail: Boolean(document.querySelector('.conversation-outline-rail')),
+    ticks: document.querySelectorAll('.conversation-outline-tick').length,
+    userPrompts: document.querySelectorAll('.conversation-message[data-role="user"]').length,
+    panelHiddenUntilHover: !document.querySelector('.conversation-outline-panel'),
+    duplicateInspectorTab: [...document.querySelectorAll('.inspector-tabs button')].some((button) => button.textContent.trim() === '预览'),
+    projectGroups: document.querySelectorAll('.project-group').length,
+    projectNames: [...document.querySelectorAll('.project-group-open strong')].map((node) => node.textContent.trim()),
+    disabledSessions: document.querySelectorAll('.session-row:disabled').length,
+    disabledProjectActions: document.querySelectorAll('.project-group-new:disabled').length,
+  })`)
+  assert(navigation.navigatorRail && navigation.ticks >= 2, `Conversation navigator is missing: ${JSON.stringify(navigation)}`)
+  assert(navigation.ticks <= navigation.userPrompts && navigation.panelHiddenUntilHover && !navigation.duplicateInspectorTab, `Conversation navigator is not compact or user-only: ${JSON.stringify(navigation)}`)
+  assert(navigation.projectGroups >= 2 && navigation.projectNames.includes('api-gateway'), `Multiple project groups are missing: ${JSON.stringify(navigation)}`)
+  assert(!navigation.disabledSessions && !navigation.disabledProjectActions, `Concurrent navigation is still disabled: ${JSON.stringify(navigation)}`)
+  await evaluate("[...document.querySelectorAll('.project-group')].find((group) => group.querySelector('strong')?.textContent === 'api-gateway').querySelector('.session-row').click()")
+  await waitFor("document.querySelector('.project-trigger strong')?.textContent === 'api-gateway'", 'cross-project session navigation')
+  await capture('desktop-multi-project-1627x967.png')
+  await evaluate("[...document.querySelectorAll('.session-row')].find((row) => row.textContent.includes('优化数据同步性能')).click()")
+  await waitFor("document.querySelector('.project-trigger strong')?.textContent === 'pi-monitor'", 'the original project session')
+  await evaluate(`(() => {
+    const rail = document.querySelector('.conversation-outline-rail')
+    rail.focus()
+    rail.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true }))
+  })()`)
+  await waitFor("Boolean(document.querySelector('.conversation-outline-panel'))", 'the hovered conversation preview')
+  await evaluate("document.querySelector('.conversation-outline-panel button:first-child').click()")
+  await waitFor("document.querySelector('.conversation-outline-rail')?.getAttribute('aria-label')?.includes('第 1 条')", 'the first conversation preview jump')
+  await evaluate(`(() => {
+    const rail = document.querySelector('.conversation-outline-rail')
+    rail.focus()
+    rail.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }))
+  })()`)
+  await waitFor("Boolean(document.querySelector('.conversation-outline-panel'))", 'the latest conversation preview')
+  await evaluate("document.querySelector('.conversation-outline-panel button:last-child').click()")
+  await waitFor("(() => { const label = document.querySelector('.conversation-outline-rail')?.getAttribute('aria-label') ?? ''; const match = label.match(/第 (\\d+) 条，共 (\\d+) 条/); return Boolean(match && match[1] === match[2]) })()", 'the latest conversation preview jump')
+  await evaluate("document.activeElement.blur(); document.querySelector('.conversation-outline-rail').focus()")
+  await waitFor("Boolean(document.querySelector('.conversation-outline-panel'))", 'the reopened conversation preview')
+  await capture('desktop-conversation-preview-1627x967.png')
+  await evaluate("document.querySelector('.activity-button[aria-label=\"会话上下文\"]').click()")
+  await waitFor("document.querySelector('.compaction-status')?.textContent.includes('已压缩 1 次')", 'the context inspector')
+  await evaluate("document.querySelector('.jump-to-latest')?.click()")
+  await waitFor("(() => { const timeline = document.querySelector('.timeline-scroll'); return timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 110 })()", 'the restored bottom pin')
+  await evaluate(`(() => {
+    const marker = document.createElement('div')
+    marker.id = 'qa-stream-growth'
+    marker.style.height = '600px'
+    document.querySelector('.timeline-inner').append(marker)
+  })()`)
+  await wait(150)
+  const autoScrollDistance = await evaluate(`(() => {
+    const timeline = document.querySelector('.timeline-scroll')
+    return timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight
+  })()`)
+  assert(autoScrollDistance < 110, `The streaming conversation lost its bottom pin: ${autoScrollDistance}px`)
+  await evaluate("document.querySelector('#qa-stream-growth').remove()")
+  await evaluate(`(() => {
+    const bytes = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z2SAAAAAASUVORK5CYII='), (character) => character.charCodeAt(0))
+    const file = new File([bytes], 'clipboard.png', { type: 'image/png' })
+    const event = new Event('paste', { bubbles: true, cancelable: true })
+    Object.defineProperty(event, 'clipboardData', {
+      value: { items: [{ kind: 'file', type: file.type, getAsFile: () => file }] },
+    })
+    document.querySelector('.composer textarea').dispatchEvent(event)
+  })()`)
+  await waitFor("document.querySelectorAll('.composer-image').length === 1 && !document.querySelector('.send-button')?.disabled", 'the pasted image preview')
+  await evaluate("document.querySelector('.send-button').click()")
+  await waitFor("Boolean([...document.querySelectorAll('.conversation-message[data-role=\"user\"]')].at(-1)?.querySelector('.message-images img'))", 'the pasted image in the conversation')
+  await waitFor("!document.querySelector('.composer-image')", 'the pasted image preview to clear after sending')
+  await capture('desktop-pasted-image-1627x967.png')
+  await evaluate("[...document.querySelectorAll('.conversation-message[data-role=\"user\"] .message-images button')].at(-1).click()")
+  await waitFor("Boolean(document.querySelector('.image-lightbox'))", 'the sent image lightbox')
+  await capture('desktop-image-lightbox-1627x967.png')
+  await evaluate("document.querySelector('.image-lightbox button[aria-label=\"关闭图片预览\"]').click()")
+  await waitFor("!document.querySelector('.image-lightbox')", 'the sent image lightbox to close')
+  await clickSelector('.composer textarea')
+  await client.send('Input.insertText', { text: '请模拟网络失败 [demo-fail]' })
+  await waitFor("document.querySelector('.composer textarea')?.value.includes('[demo-fail]') && !document.querySelector('.send-button')?.disabled", 'the simulated failure prompt')
+  await evaluate("document.querySelector('.send-button').click()")
+  await wait(350)
+  const failedPrompt = await evaluate(`({
+    retryable: Boolean([...document.querySelectorAll('.message-error')].find((node) => node.textContent.includes('检查网络') && node.querySelector('button'))),
+    recentMessages: [...document.querySelectorAll('.conversation-message')].slice(-4).map((node) => node.innerText),
+    textarea: document.querySelector('.composer textarea')?.value,
+    toasts: [...document.querySelectorAll('.toast-card')].map((node) => node.innerText),
+  })`)
+  assert(failedPrompt.retryable, `The failed prompt is not retryable: ${JSON.stringify(failedPrompt)}`)
+  await capture('desktop-retryable-prompt-1627x967.png')
+  await clickSelector('.project-group:first-child > div:last-child .session-row-shell:nth-child(2) .session-more')
+  await waitFor("Boolean(document.querySelector('.session-menu'))", 'the session actions menu')
+  await clickSelector('.session-menu [role="menuitem"]')
+  await waitFor("document.querySelector('.archived-toggle')?.textContent.includes('已归档 1')", 'the archived session entry')
+  await evaluate("document.querySelector('.archived-toggle').click()")
+  await waitFor("Boolean([...document.querySelectorAll('.session-row-shell')].find((row) => row.textContent.includes('修复登录态丢失问题')))", 'the archived session list')
+  await clickSelector('.session-row-shell .session-more')
+  await waitFor("Boolean([...document.querySelectorAll('.session-menu [role=\"menuitem\"]')].find((item) => item.textContent.includes('恢复会话')))", 'the restore session action')
+  await clickSelector('.session-menu [role="menuitem"]')
+  await waitFor("!document.querySelector('.archived-toggle') && Boolean([...document.querySelectorAll('.session-row')].find((row) => row.textContent.includes('修复登录态丢失问题')))", 'the restored session')
+  if (navigationOnly) {
+    await evaluate("document.querySelector('.activity-button[aria-label=\"配置\"]').click()")
+    await waitFor("Boolean(document.querySelector('.settings-dialog'))", 'settings for the light-theme audit')
+    await evaluate("[...document.querySelectorAll('.settings-nav button')].find((button) => button.title === '外观').click()")
+    await waitFor("document.querySelector('.settings-header')?.innerText.includes('调整阅读舒适度')", 'appearance settings for the light-theme audit')
+    await evaluate("document.querySelector('[data-theme-preview=\"light\"]').click()")
+    await waitFor("document.documentElement.dataset.theme === 'light'", 'the light theme for the visual audit')
+    await capture('light-settings-1627x967.png')
+    await evaluate("document.querySelector('.settings-dialog button[aria-label=\"关闭设置\"]').click()")
+    await waitFor("!document.querySelector('.settings-dialog')", 'settings to close after selecting the light theme')
+    await capture('light-main-1627x967.png')
+    await evaluate("document.querySelector('.conversation-outline-rail').focus()")
+    await waitFor("Boolean(document.querySelector('.conversation-outline-panel'))", 'the light conversation preview')
+    await capture('light-conversation-preview-1627x967.png')
+    await evaluate("document.activeElement.blur(); document.querySelector('.model-trigger').click()")
+    await waitFor("Boolean(document.querySelector('.model-picker-popover'))", 'the light model picker')
+    await capture('light-model-picker-1627x967.png')
+    const lightSurfaces = await evaluate(`Object.fromEntries([
+      ['sidebar', '.task-sidebar'],
+      ['titlebar', '.titlebar'],
+      ['timeline', '.timeline-scroll'],
+      ['composer', '.composer'],
+      ['inspector', '.inspector'],
+      ['modelPicker', '.model-picker-popover'],
+    ].map(([name, selector]) => [name, getComputedStyle(document.querySelector(selector)).backgroundColor]))`)
+    const lightPalette = await evaluate(`Object.fromEntries([
+      ['newTaskBackground', '.new-task-button', 'backgroundColor'],
+      ['projectTriggerBackground', '.project-trigger', 'backgroundColor'],
+      ['modelGroupBackground', '.model-group-heading', 'backgroundColor'],
+      ['modelFooterBackground', '.model-picker-footer', 'backgroundColor'],
+      ['sessionText', '.session-row:not([data-active])', 'color'],
+      ['modelNameText', '.model-option-copy strong', 'color'],
+    ].map(([name, selector, property]) => [name, getComputedStyle(document.querySelector(selector))[property]]))`)
+    for (const [name, color] of Object.entries(lightPalette)) {
+      const isText = name.endsWith('Text')
+      assert(isText ? rgbTotal(color) < 480 : rgbTotal(color) > 600, `Light theme ${name} has poor contrast: ${color}`)
+    }
+    await evaluate("document.querySelector('.model-trigger').click(); document.querySelector('.activity-button[aria-label=\"Git 变更\"]').click()")
+    await waitFor("Boolean(document.querySelector('.changes-panel'))", 'the light Git changes panel')
+    await capture('light-git-changes-1627x967.png')
+    await evaluate("document.querySelector('.activity-button[aria-label=\"项目文件\"]').click()")
+    await waitFor("Boolean(document.querySelector('.files-panel .file-tree'))", 'the light project files panel')
+    await capture('light-project-files-1627x967.png')
+    await evaluate("document.querySelector('.tree-row[aria-label=\"预览 app.ts\"]').click()")
+    await waitFor("Boolean(document.querySelector('.file-preview-dialog .source-preview'))", 'the light source file preview')
+    await capture('light-file-preview-1627x967.png')
+    await evaluate("document.querySelector('.file-preview-dialog button[aria-label=\"关闭预览\"]').click()")
+    await waitFor("!document.querySelector('.file-preview-dialog')", 'the light source file preview to close')
+    await evaluate("document.querySelector('[aria-label=\"从历史消息继续\"]').click()")
+    await waitFor("Boolean(document.querySelector('.session-branch-dialog'))", 'the light branch dialog')
+    await capture('light-branch-dialog-1627x967.png')
+    await evaluate("document.querySelector('.session-branch-dialog button[aria-label=\"关闭\"]').click()")
+    await waitFor("!document.querySelector('.session-branch-dialog')", 'the light branch dialog to close')
+    await clickSelector('.project-trigger')
+    await waitFor("Boolean(document.querySelector('.project-menu'))", 'the light project menu')
+    const lightProjectMenuBackground = await evaluate("getComputedStyle(document.querySelector('.project-menu')).backgroundColor")
+    assert(rgbTotal(lightProjectMenuBackground) > 600, `The light project menu is still dark: ${lightProjectMenuBackground}`)
+    await capture('light-project-menu-1627x967.png')
+    await clickSelector('.project-trigger')
+    await waitFor("!document.querySelector('.project-menu')", 'the light project menu to close')
+    await evaluate("document.querySelector('.activity-button[aria-label=\"配置\"]').click()")
+    await waitFor("Boolean(document.querySelector('.settings-dialog'))", 'settings to restore the dark theme')
+    await evaluate("[...document.querySelectorAll('.settings-nav button')].find((button) => button.title === 'Skills 与 Plugins').click()")
+    await waitFor("document.querySelectorAll('.resource-card-icon.skill').length === 2", 'the light resources settings')
+    await capture('light-settings-resources-1627x967.png')
+    await evaluate("[...document.querySelectorAll('.settings-nav button')].find((button) => button.title === 'Provider 与模型').click()")
+    await waitFor("Boolean(document.querySelector('.provider-settings-layout'))", 'the light provider settings')
+    await capture('light-settings-providers-1627x967.png')
+    await evaluate("document.querySelector('.custom-provider-button').click()")
+    await waitFor("Boolean(document.querySelector('.custom-model-editor'))", 'the light custom model editor')
+    await capture('light-settings-custom-model-1627x967.png')
+    await evaluate("[...document.querySelectorAll('.settings-nav button')].find((button) => button.title === '外观').click()")
+    await waitFor("Boolean(document.querySelector('[data-theme-preview=\"dark\"]'))", 'appearance settings while restoring the dark theme')
+    await evaluate("document.querySelector('[data-theme-preview=\"dark\"]').click()")
+    await waitFor("document.documentElement.dataset.theme === 'dark'", 'the dark theme to be restored after the light-theme audit')
+    await evaluate("document.querySelector('.settings-dialog button[aria-label=\"关闭设置\"]').click()")
+    await waitFor("!document.querySelector('.settings-dialog')", 'settings to close after the light-theme audit')
+    for (const scale of [1.25, 1.5]) {
+      await client.send('Emulation.setDeviceMetricsOverride', { width: 1627, height: 967, deviceScaleFactor: scale, mobile: false, screenWidth: 1627, screenHeight: 967 })
+      await wait(250)
+      const scaled = await evaluate(`({ width: innerWidth, documentWidth: document.documentElement.scrollWidth })`)
+      assert(scaled.width === 1627 && scaled.documentWidth <= 1627, `Layout overflowed at ${scale * 100}% scaling: ${JSON.stringify(scaled)}`)
+      await capture(`desktop-scale-${Math.round(scale * 100)}.png`)
+    }
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 1180, height: 768, deviceScaleFactor: 1, mobile: false, screenWidth: 1180, screenHeight: 768 })
+    await wait(300)
+    const tablet = await evaluate(`({
+      documentWidth: document.documentElement.scrollWidth,
+      outlineVisible: getComputedStyle(document.querySelector('.conversation-outline')).display !== 'none',
+    })`)
+    assert(tablet.documentWidth <= 1180 && tablet.outlineVisible, `Tablet preview layout failed: ${JSON.stringify(tablet)}`)
+    await capture('tablet-conversation-preview-1180x768.png')
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 768, height: 768, deviceScaleFactor: 1, mobile: false, screenWidth: 768, screenHeight: 768 })
+    await wait(300)
+    const narrow = await evaluate(`({
+      documentWidth: document.documentElement.scrollWidth,
+      outlineHidden: getComputedStyle(document.querySelector('.conversation-outline')).display === 'none',
+    })`)
+    assert(narrow.documentWidth <= 768 && narrow.outlineHidden, `Narrow preview layout failed: ${JSON.stringify(narrow)}`)
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 320, height: 720, deviceScaleFactor: 1, mobile: false, screenWidth: 320, screenHeight: 720 })
+    await wait(300)
+    const mobile = await evaluate(`({
+      documentWidth: document.documentElement.scrollWidth,
+      outlineHidden: getComputedStyle(document.querySelector('.conversation-outline')).display === 'none',
+    })`)
+    assert(mobile.documentWidth <= 320 && mobile.outlineHidden, `Mobile layout failed: ${JSON.stringify(mobile)}`)
+    await capture('mobile-main-320x720.png')
+    await wait(250)
+    assert(consoleIssues.length === 0, `Renderer console issues:\n${consoleIssues.join('\n')}`)
+    console.log(JSON.stringify({
+      passed: true,
+      targetUrl,
+      viewports: ['1627x967', '1180x768', '768x768', '320x720'],
+      identity,
+      navigation,
+      autoScrollDistance,
+      lightSurfaces,
+      lightPalette,
+      lightProjectMenuBackground,
+      responsive: { tablet, narrow, mobile },
+      interactions: ['conversation preview', 'clipboard image paste and zoom', 'retryable prompt failure', 'session archive and restore', 'light theme surfaces', '125% and 150% scaling', 'auto-scroll on timeline growth', 'cross-project session navigation'],
+      screenshots,
+      consoleIssues,
+    }, null, 2))
+    break qa
+  }
   const responseFooter = await evaluate(`(() => {
     const footer = [...document.querySelectorAll('.message-footer')].at(-1)
     if (!footer) return null
@@ -457,7 +684,7 @@ try {
     viewports: ['1627x967', '390x844'],
     identity,
     modelPicker,
-    interactions: ['model picker', 'UTF-8 Git changes', 'binary Git changes', 'chat settings', 'theme switch', 'skills/plugins/packages', 'OAuth progress', 'custom models', 'branch/fork', 'worktrees', 'project files', 'mobile model picker'],
+    interactions: ['conversation preview', 'clipboard image paste', 'auto-scroll on timeline growth', 'multi-project sidebar', 'model picker', 'UTF-8 Git changes', 'binary Git changes', 'chat settings', 'theme switch', 'skills/plugins/packages', 'OAuth progress', 'custom models', 'branch/fork', 'worktrees', 'project files', 'mobile model picker'],
     screenshots,
     consoleIssues,
   }, null, 2))

@@ -10,6 +10,7 @@ import type {
   FileNode,
   FilePreview,
   ModelOption,
+  PromptImage,
   ProjectInfo,
   ProviderOption,
   ProviderAuthFlow,
@@ -24,6 +25,7 @@ import type {
   UiMessage,
   WorktreeInfo,
 } from '../shared/contracts'
+import { friendlyPromptError } from '../shared/prompt-error'
 
 interface ToastMessage {
   id: string
@@ -64,13 +66,16 @@ interface AppState {
   initialize: () => Promise<() => void>
   chooseProject: () => Promise<void>
   openProject: (path: string) => Promise<void>
-  createSession: () => Promise<void>
-  openSession: (path: string) => Promise<void>
+  createSession: (projectPath?: string) => Promise<void>
+  openSession: (path: string, projectPath?: string) => Promise<void>
+  setSessionArchived: (path: string, projectPath: string, archived: boolean) => Promise<void>
+  deleteSession: (path: string, projectPath: string) => Promise<void>
   renameSession: (name: string) => Promise<void>
   branchSession: (entryId: string) => Promise<boolean>
   forkSession: (entryId: string) => Promise<boolean>
   compactSession: () => Promise<void>
-  sendPrompt: (text: string, behavior?: 'steer' | 'followUp', autoNamingMode?: AutoNamingMode) => Promise<boolean>
+  sendPrompt: (text: string, behavior?: 'steer' | 'followUp', autoNamingMode?: AutoNamingMode, images?: PromptImage[]) => Promise<boolean>
+  retryPrompt: (messageId: string) => Promise<boolean>
   abortAgent: () => Promise<void>
   setModel: (key: string, level: ThinkingLevel) => Promise<void>
   saveProviderKey: (provider: string, key: string, remember: boolean) => Promise<boolean>
@@ -111,6 +116,7 @@ const EMPTY_STATS: SessionStats = {
 function snapshotState(snapshot: AgentSnapshot): Partial<AppState> {
   return {
     project: snapshot.project,
+    recentProjects: snapshot.recentProjects,
     sessions: snapshot.sessions,
     forkPoints: snapshot.forkPoints,
     messages: snapshot.messages,
@@ -151,6 +157,20 @@ export function reduceDesktopEvent(state: AppState, event: DesktopEvent): Partia
               updatedAt: event.streaming ? Date.now() : session.updatedAt,
             }
           : session),
+      }
+    case 'session:status':
+      return {
+        streaming: state.sessionId === event.sessionId ? event.streaming : state.streaming,
+        sessions: state.sessions.map((session) =>
+          session.id === event.sessionId || session.path === event.sessionFile
+            ? { ...session, streaming: event.streaming, updatedAt: event.streaming ? Date.now() : session.updatedAt }
+            : session,
+        ),
+      }
+    case 'prompt:failed':
+      return {
+        messages: updateMessage(state.messages, event.promptId, (message) => ({ ...message, status: 'error', error: event.message })),
+        toasts: [...state.toasts, { id: crypto.randomUUID(), title: '消息发送失败', message: event.message }],
       }
     case 'compaction:status':
       return { compaction: event.compaction }
@@ -320,7 +340,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   toasts: [],
 
   initialize: async () => {
-    const unsubscribe = desktop.onEvent(applyDesktopEvent)
+    const unsubscribe = desktop.onEvent((event) => applyDesktopEvent(event))
     try {
       const bootstrap = await desktop.bootstrap()
       set((state) => ({
@@ -362,22 +382,50 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  createSession: async () => {
-    if (!get().project) return get().chooseProject()
+  createSession: async (projectPath) => {
+    if (!projectPath && !get().project) return get().chooseProject()
     try {
-      const snapshot = await desktop.createSession()
+      const snapshot = await desktop.createSession(projectPath)
       set(snapshotState(snapshot))
     } catch (error) {
       set((state) => ({ toasts: [...state.toasts, createErrorToast(error)] }))
     }
   },
 
-  openSession: async (path) => {
+  openSession: async (path, projectPath) => {
     try {
-      const snapshot = await desktop.openSession(path)
+      const snapshot = await desktop.openSession(path, projectPath)
       set(snapshotState(snapshot))
     } catch (error) {
       set((state) => ({ toasts: [...state.toasts, createErrorToast(error)] }))
+    }
+  },
+
+  setSessionArchived: async (path, projectPath, archived) => {
+    try {
+      const snapshot = await desktop.setSessionArchived(path, projectPath, archived)
+      set((state) => ({
+        ...snapshotState(snapshot),
+        toasts: [...state.toasts, {
+          id: crypto.randomUUID(),
+          title: archived ? '会话已归档' : '会话已恢复',
+          message: archived ? '可从侧栏的“已归档”中恢复。' : '会话已回到项目列表。',
+        }],
+      }))
+    } catch (error) {
+      set((state) => ({ toasts: [...state.toasts, createErrorToast(error, archived ? '归档失败' : '恢复失败')] }))
+    }
+  },
+
+  deleteSession: async (path, projectPath) => {
+    try {
+      const snapshot = await desktop.deleteSession(path, projectPath)
+      set((state) => ({
+        ...snapshotState(snapshot),
+        toasts: [...state.toasts, { id: crypto.randomUUID(), title: '会话已移到回收站', message: '需要时可从 Windows 回收站恢复。' }],
+      }))
+    } catch (error) {
+      set((state) => ({ toasts: [...state.toasts, createErrorToast(error, '删除失败')] }))
     }
   },
 
@@ -440,8 +488,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  sendPrompt: async (text, behavior, autoNamingMode) => {
-    const normalized = text.trim()
+  sendPrompt: async (text, behavior, autoNamingMode, images = []) => {
+    const normalized = text.trim() || (images.length ? '请查看附带的图片。' : '')
     if (!normalized) return false
     const optimistic: UiMessage = {
       id: `local-${crypto.randomUUID()}`,
@@ -449,15 +497,34 @@ export const useAppStore = create<AppState>((set, get) => ({
       content: normalized,
       timestamp: Date.now(),
       status: 'complete',
+      images,
     }
     set((state) => ({ messages: [...state.messages, optimistic] }))
     try {
-      await desktop.sendPrompt(normalized, behavior, autoNamingMode)
+      await desktop.sendPrompt(normalized, behavior, autoNamingMode, images, optimistic.id)
       return true
     } catch (error) {
+      const friendly = friendlyPromptError(error)
       set((state) => ({
         messages: state.messages.filter((message) => message.id !== optimistic.id),
-        toasts: [...state.toasts, createErrorToast(error, '消息发送失败')],
+        toasts: [...state.toasts, { id: crypto.randomUUID(), title: '消息发送失败', message: friendly }],
+      }))
+      return false
+    }
+  },
+
+  retryPrompt: async (messageId) => {
+    const message = get().messages.find((candidate) => candidate.id === messageId && candidate.role === 'user')
+    if (!message) return false
+    set((state) => ({ messages: updateMessage(state.messages, messageId, (candidate) => ({ ...candidate, status: 'complete', error: undefined })) }))
+    try {
+      await desktop.sendPrompt(message.content, undefined, 'off', message.images, message.id)
+      return true
+    } catch (error) {
+      const friendly = friendlyPromptError(error)
+      set((state) => ({
+        messages: updateMessage(state.messages, messageId, (candidate) => ({ ...candidate, status: 'error', error: friendly })),
+        toasts: [...state.toasts, { id: crypto.randomUUID(), title: '重试失败', message: friendly }],
       }))
       return false
     }

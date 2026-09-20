@@ -160,6 +160,38 @@ const fileTree: FileNode[] = [
 
 const messages: UiMessage[] = [
   {
+    id: 'demo-user-setup',
+    role: 'user',
+    content: '先定位同步链路里最慢的阶段，别急着改代码。',
+    timestamp: Date.now() - 540_000,
+    status: 'complete',
+  },
+  {
+    id: 'demo-assistant-setup',
+    role: 'assistant',
+    content: '性能采样显示，主要耗时来自逐条数据库写入和连接池等待。',
+    timestamp: Date.now() - 500_000,
+    status: 'complete',
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-5',
+  },
+  {
+    id: 'demo-user-plan',
+    role: 'user',
+    content: '把数据库写入改成批量处理，同时限制并发，先说明会影响哪些文件。',
+    timestamp: Date.now() - 420_000,
+    status: 'complete',
+  },
+  {
+    id: 'demo-assistant-plan',
+    role: 'assistant',
+    content: '改动会集中在同步服务、数据库迁移和性能测试三个位置。',
+    timestamp: Date.now() - 380_000,
+    status: 'complete',
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-5',
+  },
+  {
     id: 'demo-user',
     role: 'user',
     content: '分析并优化用户数据同步的性能瓶颈，要求减少延迟、降低资源占用，并给出改动说明。',
@@ -214,6 +246,22 @@ let snapshot: AgentSnapshot = {
     isGit: true,
     dirtyCount: 3,
   },
+  recentProjects: [
+    {
+      name: 'pi-monitor',
+      path: 'D:\\Projects\\pi-monitor',
+      branch: 'main',
+      isGit: true,
+      dirtyCount: 3,
+    },
+    {
+      name: 'api-gateway',
+      path: 'D:\\Projects\\api-gateway',
+      branch: 'develop',
+      isGit: true,
+      dirtyCount: 0,
+    },
+  ],
   worktrees: [
     { path: 'D:\\Projects\\pi-monitor', branch: 'main', head: 'f3a20c1', current: true, bare: false },
     { path: 'D:\\Projects\\pi-monitor-auth', branch: 'feature/auth-recovery', head: '72b5ed9', current: false, bare: false },
@@ -234,7 +282,7 @@ let snapshot: AgentSnapshot = {
       projectPath: 'D:\\Projects\\pi-monitor',
       createdAt: Date.now() - 180_000,
       updatedAt: Date.now(),
-      messageCount: 5,
+      messageCount: 6,
       active: true,
     },
     {
@@ -272,6 +320,15 @@ let snapshot: AgentSnapshot = {
       createdAt: Date.now() - 432_000_000,
       updatedAt: Date.now() - 432_000_000,
       messageCount: 6,
+    },
+    {
+      id: 'demo-6',
+      path: 'demo://session-6',
+      title: '梳理网关鉴权流程',
+      projectPath: 'D:\\Projects\\api-gateway',
+      createdAt: Date.now() - 7_200_000,
+      updatedAt: Date.now() - 7_200_000,
+      messageCount: 9,
     },
   ],
   changes: [
@@ -401,7 +458,7 @@ export function createDemoBridge(): DesktopBridge {
         version: '0.1.0-demo',
         platform: 'browser',
         demoMode: true,
-        recentProjects: [snapshot.project],
+        recentProjects: snapshot.recentProjects,
         providers,
         models,
         snapshot: cloneSnapshot(),
@@ -410,7 +467,9 @@ export function createDemoBridge(): DesktopBridge {
     async chooseProject() {
       return cloneSnapshot()
     },
-    async openProject() {
+    async openProject(projectPath: string) {
+      const project = snapshot.recentProjects.find((item) => item.path === projectPath)
+      if (project) snapshot = { ...snapshot, project }
       return cloneSnapshot()
     },
     async refreshWorkspace() {
@@ -437,9 +496,11 @@ export function createDemoBridge(): DesktopBridge {
         content: `// ${filePath}\n\nexport async function syncBatch(items: Item[]) {\n  return database.upsert(items)\n}\n`,
       }
     },
-    async createSession() {
+    async createSession(projectPath?: string) {
+      const project = snapshot.recentProjects.find((item) => item.path === projectPath) ?? snapshot.project
       snapshot = {
         ...snapshot,
+        project,
         sessionId: `demo-${Date.now()}`,
         sessionName: '新任务',
         messages: [],
@@ -448,10 +509,60 @@ export function createDemoBridge(): DesktopBridge {
       }
       return cloneSnapshot()
     },
-    async openSession(sessionPath: string) {
+    async openSession(sessionPath: string, projectPath?: string) {
+      const session = snapshot.sessions.find((item) => item.path === sessionPath)
+      const project = snapshot.recentProjects.find((item) => item.path === (projectPath ?? session?.projectPath)) ?? snapshot.project
       snapshot = {
         ...snapshot,
+        project,
+        sessionId: session?.id ?? snapshot.sessionId,
+        sessionName: session?.title ?? snapshot.sessionName,
         sessions: snapshot.sessions.map((session) => ({ ...session, active: session.path === sessionPath })),
+      }
+      return cloneSnapshot()
+    },
+    async setSessionArchived(sessionPath: string, projectPath: string, archived: boolean) {
+      const active = snapshot.sessions.some((session) => session.path === sessionPath && session.active)
+      snapshot = {
+        ...snapshot,
+        sessions: snapshot.sessions.map((session) => session.path === sessionPath ? { ...session, archived } : session),
+      }
+      if (active && archived) {
+        const sessionId = `demo-${Date.now()}`
+        snapshot = {
+          ...snapshot,
+          project: snapshot.recentProjects.find((item) => item.path === projectPath) ?? snapshot.project,
+          sessionId,
+          sessionFile: `demo://${sessionId}`,
+          sessionName: '新任务',
+          messages: [],
+          forkPoints: [],
+          sessions: [
+            { id: sessionId, path: `demo://${sessionId}`, title: '新任务', projectPath, createdAt: Date.now(), updatedAt: Date.now(), messageCount: 0, active: true },
+            ...snapshot.sessions.map((session) => ({ ...session, active: false })),
+          ],
+        }
+      }
+      return cloneSnapshot()
+    },
+    async deleteSession(sessionPath: string, projectPath: string) {
+      const active = snapshot.sessions.some((session) => session.path === sessionPath && session.active)
+      snapshot = { ...snapshot, sessions: snapshot.sessions.filter((session) => session.path !== sessionPath) }
+      if (active) {
+        const sessionId = `demo-${Date.now()}`
+        snapshot = {
+          ...snapshot,
+          project: snapshot.recentProjects.find((item) => item.path === projectPath) ?? snapshot.project,
+          sessionId,
+          sessionFile: `demo://${sessionId}`,
+          sessionName: '新任务',
+          messages: [],
+          forkPoints: [],
+          sessions: [
+            { id: sessionId, path: `demo://${sessionId}`, title: '新任务', projectPath, createdAt: Date.now(), updatedAt: Date.now(), messageCount: 0, active: true },
+            ...snapshot.sessions,
+          ],
+        }
       }
       return cloneSnapshot()
     },
@@ -511,7 +622,12 @@ export function createDemoBridge(): DesktopBridge {
       emit({ type: 'compaction:status', compaction: snapshot.compaction })
       return cloneSnapshot()
     },
-    async sendPrompt(text: string, _behavior, autoNamingMode = 'smart') {
+    async sendPrompt(text: string, _behavior, autoNamingMode = 'smart', images = [], promptId?: string) {
+      void images
+      if (text.includes('[demo-fail]')) {
+        window.setTimeout(() => emit({ type: 'prompt:failed', promptId: promptId ?? 'missing', message: '无法连接模型服务，请检查网络后重试。' }), 80)
+        return
+      }
       const messageId = `demo-assistant-${Date.now()}`
       const startedAt = Date.now()
       if ((!snapshot.sessionName || snapshot.sessionName === '新任务') && autoNamingMode !== 'off') {
@@ -650,6 +766,7 @@ export function createDemoBridge(): DesktopBridge {
         providerName: model.providerName,
         authenticated: model.localNoAuth,
         reasoning: model.reasoning,
+        imageInput: model.imageInput,
         thinkingLevels: model.reasoning ? ['off', 'low', 'medium', 'high'] : ['off'],
         contextWindow: model.contextWindow,
         maxTokens: model.maxTokens,

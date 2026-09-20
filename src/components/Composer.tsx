@@ -17,7 +17,8 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import type { FileNode, ModelOption, ThinkingLevel } from '../shared/contracts'
+import type { FileNode, ModelOption, PromptImage, ThinkingLevel } from '../shared/contracts'
+import { MAX_PROMPT_IMAGE_BYTES, MAX_PROMPT_IMAGES, PROMPT_IMAGE_MIME_TYPES, promptImageError } from '../shared/prompt-images'
 import { useAppStore } from '../store/use-app-store'
 import { useUiPreferences } from '../store/use-ui-preferences'
 import { ProviderLogo } from './ProviderLogo'
@@ -71,6 +72,22 @@ function flattenFiles(nodes: FileNode[]): FileNode[] {
 function parentPath(path: string): string {
   const index = path.lastIndexOf('/')
   return index < 0 ? '项目根目录' : path.slice(0, index)
+}
+
+function readPromptImage(file: File, name: string): Promise<PromptImage> {
+  if (!PROMPT_IMAGE_MIME_TYPES.has(file.type)) return Promise.reject(new Error('仅支持 PNG、JPEG、WebP 和 GIF 图片。'))
+  if (file.size > MAX_PROMPT_IMAGE_BYTES) return Promise.reject(new Error('单张图片不能超过 10 MB。'))
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error ?? new Error('读取图片失败。'))
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : ''
+      const data = result.slice(result.indexOf(',') + 1)
+      if (!data) reject(new Error('图片内容为空。'))
+      else resolve({ id: crypto.randomUUID(), name, mimeType: file.type, data })
+    }
+    reader.readAsDataURL(file)
+  })
 }
 
 function ModelPicker({
@@ -352,6 +369,8 @@ function ModelPicker({
 
 export function Composer({ focusMode, onToggleFocus, onOpenSettings }: ComposerProps) {
   const [value, setValue] = useState('')
+  const [images, setImages] = useState<PromptImage[]>([])
+  const [imageError, setImageError] = useState('')
   const [suggestionsOpen, setSuggestionsOpen] = useState(false)
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [historyIndex, setHistoryIndex] = useState(-1)
@@ -424,17 +443,53 @@ export function Composer({ focusMode, onToggleFocus, onOpenSettings }: ComposerP
 
   const submit = async () => {
     const prompt = value.trim()
-    if (!prompt) return
+    if (!prompt && !images.length) return
     if (!selectedModel) {
       onOpenSettings()
       return
     }
+    if (images.length && selectedModel.imageInput === false) {
+      setImageError(`${selectedModel.name} 不支持图片输入，请切换支持图片的模型。`)
+      return
+    }
+    const pendingImages = images
     setValue('')
+    setImages([])
+    setImageError('')
     setSuggestionsOpen(false)
     setHistoryIndex(-1)
     if (textareaRef.current) textareaRef.current.style.height = ''
-    const sent = await sendPrompt(prompt, streaming ? followUpBehavior : undefined, autoNamingMode)
-    if (!sent) setComposerText(prompt)
+    const sent = await sendPrompt(prompt, streaming ? followUpBehavior : undefined, autoNamingMode, pendingImages)
+    if (!sent) {
+      setImages(pendingImages)
+      setComposerText(prompt)
+    }
+  }
+
+  const pasteImages = async (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = [...event.clipboardData.items]
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .flatMap((item) => item.getAsFile() ?? [])
+    if (!files.length) return
+    event.preventDefault()
+    const remaining = MAX_PROMPT_IMAGES - images.length
+    if (remaining <= 0) {
+      setImageError(`最多添加 ${MAX_PROMPT_IMAGES} 张图片。`)
+      return
+    }
+    try {
+      const pasted = await Promise.all(files.slice(0, remaining).map((file, index) =>
+        readPromptImage(file, file.name || `剪贴板图片 ${images.length + index + 1}`)))
+      const next = [...images, ...pasted]
+      const error = promptImageError(next)
+      if (error) setImageError(error)
+      else {
+        setImages(next)
+        setImageError(files.length > remaining ? `最多添加 ${MAX_PROMPT_IMAGES} 张图片。` : '')
+      }
+    } catch (error) {
+      setImageError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   const selectModel = useCallback((model: ModelOption) => {
@@ -466,6 +521,27 @@ export function Composer({ focusMode, onToggleFocus, onOpenSettings }: ComposerP
   return (
     <div className="composer-region" data-focus={focusMode || undefined}>
       <div className="composer" data-streaming={streaming || undefined}>
+        {images.length ? (
+          <div className="composer-images" aria-label="待发送图片">
+            {images.map((image) => (
+              <div className="composer-image" key={image.id}>
+                <img src={`data:${image.mimeType};base64,${image.data}`} alt={image.name} />
+                <button
+                  type="button"
+                  aria-label={`移除 ${image.name}`}
+                  title="移除图片"
+                  onClick={() => {
+                    setImages((current) => current.filter((item) => item.id !== image.id))
+                    setImageError('')
+                  }}
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {imageError ? <p className="composer-image-error" role="status">{imageError}</p> : null}
         <textarea
           ref={textareaRef}
           value={value}
@@ -474,7 +550,8 @@ export function Composer({ focusMode, onToggleFocus, onOpenSettings }: ComposerP
             ? followUpBehavior === 'followUp'
               ? '添加后续要求，Pi 完成当前回复后继续…'
               : '补充当前任务，Pi 将尽快调整方向…'
-            : '@ 引用项目文件，Shift+Enter 换行，Enter 发送'}
+            : '@ 引用项目文件，可直接粘贴图片，Enter 发送'}
+          onPaste={(event) => void pasteImages(event)}
           onChange={(event) => {
             setValue(event.target.value)
             setSuggestionsOpen(true)
@@ -589,10 +666,10 @@ export function Composer({ focusMode, onToggleFocus, onOpenSettings }: ComposerP
             <ModelPicker key={streaming ? 'model-locked' : 'model-ready'} models={models} selected={selectedModel} disabled={streaming} onSelect={selectModel} onOpenSettings={onOpenSettings} />
 
             <span className="composer-mode-indicator" title="Pi 当前以构建模式运行"><Wrench size={15} /><span>Build</span></span>
-            {streaming && !value.trim() ? (
+            {streaming && !value.trim() && !images.length ? (
               <button className="stop-button" type="button" aria-label="停止 Pi" onClick={() => void abortAgent()}><Square size={12} fill="currentColor" /></button>
             ) : (
-              <button className="send-button" type="button" aria-label={selectedModel ? '发送' : '请先连接并选择模型'} title={selectedModel ? '发送' : '请先连接并选择模型'} disabled={!value.trim() || !selectedModel} onClick={() => void submit()}><ArrowUp size={18} strokeWidth={2.2} /></button>
+              <button className="send-button" type="button" aria-label={selectedModel ? '发送' : '请先连接并选择模型'} title={selectedModel ? '发送' : '请先连接并选择模型'} disabled={(!value.trim() && !images.length) || !selectedModel} onClick={() => void submit()}><ArrowUp size={18} strokeWidth={2.2} /></button>
             )}
           </div>
         </div>

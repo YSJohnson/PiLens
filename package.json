@@ -1,8 +1,9 @@
 {
   "name": "pilens",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "private": true,
   "description": "PiLens — a focused desktop workspace for the Pi coding agent.",
+  "author": "YSJohnson",
   "license": "MIT",
   "type": "module",
   "main": "out/main/main.js",

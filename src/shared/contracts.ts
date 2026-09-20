@@ -7,6 +7,8 @@ export const IPC = {
   previewWorkspaceFile: 'workspace:preview-file',
   createSession: 'session:create',
   openSession: 'session:open',
+  setSessionArchived: 'session:set-archived',
+  deleteSession: 'session:delete',
   renameSession: 'session:rename',
   branchSession: 'session:branch',
   forkSession: 'session:fork',
@@ -68,6 +70,7 @@ export interface SessionSummary {
   messageCount: number
   active?: boolean
   streaming?: boolean
+  archived?: boolean
 }
 
 export interface SessionForkPoint {
@@ -115,6 +118,7 @@ export interface ModelOption {
   providerName: string
   authenticated: boolean
   reasoning: boolean
+  imageInput?: boolean
   thinkingLevels: ThinkingLevel[]
   contextWindow: number
   maxTokens: number
@@ -214,6 +218,13 @@ export interface ToolRun {
   durationMs?: number
 }
 
+export interface PromptImage {
+  id: string
+  name: string
+  mimeType: string
+  data: string
+}
+
 export interface UiMessage {
   id: string
   role: 'user' | 'assistant' | 'notice'
@@ -226,6 +237,7 @@ export interface UiMessage {
   model?: string
   thinkingLevel?: ThinkingLevel
   durationMs?: number
+  images?: PromptImage[]
   toolRuns?: ToolRun[]
 }
 
@@ -291,6 +303,7 @@ export interface AgentSnapshot {
   sessionFile?: string
   sessionName?: string
   project: ProjectInfo
+  recentProjects: ProjectInfo[]
   messages: UiMessage[]
   sessions: SessionSummary[]
   forkPoints: SessionForkPoint[]
@@ -317,6 +330,8 @@ export interface AppBootstrap {
 
 export type DesktopEvent =
   | { type: 'agent:status'; streaming: boolean }
+  | { type: 'session:status'; sessionId?: string; sessionFile?: string; projectPath: string; streaming: boolean }
+  | { type: 'prompt:failed'; promptId: string; message: string }
   | { type: 'compaction:status'; compaction: CompactionState }
   | { type: 'message:start'; message: UiMessage }
   | { type: 'message:delta'; messageId: string; delta: string; channel: 'text' | 'thinking' }
@@ -342,13 +357,15 @@ export interface DesktopBridge {
   refreshWorkspace(): Promise<{ project: ProjectInfo; changes: FileChange[]; files: FileNode[]; worktrees: WorktreeInfo[] }>
   openWorkspaceFile(path: string): Promise<void>
   previewWorkspaceFile(path: string): Promise<FilePreview>
-  createSession(): Promise<AgentSnapshot>
-  openSession(path: string): Promise<AgentSnapshot>
+  createSession(projectPath?: string): Promise<AgentSnapshot>
+  openSession(path: string, projectPath?: string): Promise<AgentSnapshot>
+  setSessionArchived(path: string, projectPath: string, archived: boolean): Promise<AgentSnapshot>
+  deleteSession(path: string, projectPath: string): Promise<AgentSnapshot>
   renameSession(name: string): Promise<void>
   branchSession(entryId: string): Promise<{ snapshot: AgentSnapshot; editorText: string }>
   forkSession(entryId: string): Promise<{ snapshot: AgentSnapshot; editorText: string }>
   compactSession(): Promise<AgentSnapshot>
-  sendPrompt(text: string, behavior?: 'steer' | 'followUp', autoNamingMode?: AutoNamingMode): Promise<void>
+  sendPrompt(text: string, behavior?: 'steer' | 'followUp', autoNamingMode?: AutoNamingMode, images?: PromptImage[], promptId?: string): Promise<void>
   abortAgent(): Promise<void>
   setModel(modelKey: string, thinkingLevel: ThinkingLevel): Promise<AgentSnapshot>
   saveProviderKey(providerId: string, apiKey: string, remember: boolean): Promise<{ providers: ProviderOption[]; models: ModelOption[] }>

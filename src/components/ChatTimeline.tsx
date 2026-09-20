@@ -1,4 +1,5 @@
-import { lazy, memo, Suspense, useEffect, useRef, useState } from 'react'
+import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import * as Dialog from '@radix-ui/react-dialog'
 import {
   ArrowDown,
   BrainCircuit,
@@ -14,10 +15,12 @@ import {
   RotateCcw,
   TerminalSquare,
   Wrench,
+  X,
 } from 'lucide-react'
 import { formatDuration, formatMessageTimestamp, formatResponseDuration } from '../lib/format'
 import { desktop } from '../lib/desktop'
-import type { ToolRun, UiMessage } from '../shared/contracts'
+import { findActivePromptId, samplePromptIndexes, type PromptOffset } from '../lib/prompt-navigation'
+import type { PromptImage, ToolRun, UiMessage } from '../shared/contracts'
 import { useAppStore } from '../store/use-app-store'
 import { useUiPreferences } from '../store/use-ui-preferences'
 import { PiMark } from './PiMark'
@@ -25,6 +28,10 @@ import { ProviderLogo } from './ProviderLogo'
 
 const MarkdownContent = lazy(() => import('./MarkdownContent'))
 const MAX_RENDERED_TOOL_OUTPUT = 60_000
+const INITIAL_RENDERED_MESSAGES = 60
+const MESSAGE_RENDER_BATCH = 60
+const MAX_NAVIGATOR_PREVIEWS = 8
+const NAVIGATOR_HIDE_DELAY = 160
 const MESSAGE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' })
 
 function commandFromTool(tool: ToolRun): string {
@@ -164,7 +171,15 @@ const MessageDuration = memo(function MessageDuration({ message }: { message: Ui
   )
 })
 
-const ConversationMessage = memo(function ConversationMessage({ message }: { message: UiMessage }) {
+const ConversationMessage = memo(function ConversationMessage({
+  message,
+  onPreviewImage,
+  onRetry,
+}: {
+  message: UiMessage
+  onPreviewImage: (image: PromptImage) => void
+  onRetry: (messageId: string) => void
+}) {
   const isUser = message.role === 'user'
   const [copied, setCopied] = useState(false)
   const [longMessageOpen, setLongMessageOpen] = useState(false)
@@ -191,7 +206,12 @@ const ConversationMessage = memo(function ConversationMessage({ message }: { mes
   }
 
   return (
-    <article className="conversation-message" data-role={message.role}>
+    <article
+      id={`message-${message.id}`}
+      className="conversation-message"
+      data-role={message.role}
+      data-prompt-id={isUser ? message.id : undefined}
+    >
       <div className="message-avatar" data-role={message.role}>{isUser ? '你' : <PiMark size={30} />}</div>
       <div className="message-column">
         <header className="message-header">
@@ -206,6 +226,20 @@ const ConversationMessage = memo(function ConversationMessage({ message }: { mes
             </span>
           ) : null}
         </header>
+        {message.images?.length ? (
+          <div className="message-images" aria-label={`${message.images.length} 张图片`}>
+            {message.images.map((image) => (
+              <button key={image.id} type="button" onClick={() => onPreviewImage(image)} aria-label={`放大查看 ${image.name}`}>
+                <img
+                  src={`data:${image.mimeType};base64,${image.data}`}
+                  alt={image.name}
+                  title={image.name}
+                  loading="lazy"
+                />
+              </button>
+            ))}
+          </div>
+        ) : null}
         {message.thinking ? <ThinkingDisclosure content={message.thinking} streaming={message.status === 'streaming'} /> : null}
         {message.content ? (
           <>
@@ -223,7 +257,12 @@ const ConversationMessage = memo(function ConversationMessage({ message }: { mes
         ) : message.status === 'streaming' ? (
           <div className="streaming-placeholder"><span /><span /><span /></div>
         ) : null}
-        {message.error ? <p className="message-error">{message.error}</p> : null}
+        {message.error ? (
+          <div className="message-error">
+            <span>{message.error}</span>
+            {isUser ? <button type="button" onClick={() => onRetry(message.id)}><RotateCcw size={13} />重新发送</button> : null}
+          </div>
+        ) : null}
         {message.toolRuns?.length ? (
           <div className="tool-ledgers">
             {message.toolRuns.map((tool) => (
@@ -266,10 +305,36 @@ export function ChatTimeline() {
   const sessionName = useAppStore((state) => state.sessionName)
   const sessionId = useAppStore((state) => state.sessionId)
   const sendPrompt = useAppStore((state) => state.sendPrompt)
+  const retryPrompt = useAppStore((state) => state.retryPrompt)
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const pinnedToBottomRef = useRef(true)
+  const promptOffsetsRef = useRef<PromptOffset[]>([])
+  const activeUpdateFrameRef = useRef<number | undefined>(undefined)
+  const navigatorHideTimerRef = useRef<number | undefined>(undefined)
+  const pendingHistoryRestoreRef = useRef<{ scrollHeight: number; scrollTop: number } | undefined>(undefined)
+  const pendingPromptJumpRef = useRef<string | undefined>(undefined)
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
+  const [historyWindow, setHistoryWindow] = useState<{ sessionId?: string; limit: number }>(() => ({ sessionId, limit: INITIAL_RENDERED_MESSAGES }))
+  const [highlightedPromptId, setHighlightedPromptId] = useState<string>()
+  const [previewImage, setPreviewImage] = useState<PromptImage>()
+  const showImage = useCallback((image: PromptImage) => setPreviewImage(image), [])
+  const retryMessage = useCallback((messageId: string) => { void retryPrompt(messageId) }, [retryPrompt])
+  const userMessages = messages.filter((message) => message.role === 'user' && message.content.trim())
+  const renderedMessageLimit = historyWindow.sessionId === sessionId ? historyWindow.limit : INITIAL_RENDERED_MESSAGES
+  const firstRenderedMessageIndex = Math.max(0, messages.length - renderedMessageLimit)
+  const visibleMessages = messages.slice(firstRenderedMessageIndex)
+  const [activePromptId, setActivePromptId] = useState<string>()
+  const currentPromptId = userMessages.some((message) => message.id === activePromptId) ? activePromptId : userMessages.at(-1)?.id
+  const currentPromptIndex = Math.max(0, userMessages.findIndex((message) => message.id === currentPromptId))
+  const highlightedPromptIndex = userMessages.findIndex((message) => message.id === highlightedPromptId)
+  const previewCenterIndex = highlightedPromptIndex >= 0 ? highlightedPromptIndex : currentPromptIndex
+  const previewStartIndex = Math.min(
+    Math.max(0, previewCenterIndex - Math.floor(MAX_NAVIGATOR_PREVIEWS / 2)),
+    Math.max(0, userMessages.length - MAX_NAVIGATOR_PREVIEWS),
+  )
+  const previewMessages = userMessages.slice(previewStartIndex, previewStartIndex + MAX_NAVIGATOR_PREVIEWS)
+  const tickIndexes = samplePromptIndexes(userMessages.length)
   const lastMessage = messages.at(-1)
   const lastActivitySize = (lastMessage?.content.length ?? 0)
     + (lastMessage?.thinking?.length ?? 0)
@@ -280,7 +345,70 @@ export function ChatTimeline() {
     if (!viewport) return
     const nearBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 110
     pinnedToBottomRef.current = nearBottom
-    setShowJumpToLatest((visible) => visible === !nearBottom ? visible : !nearBottom)
+    setShowJumpToLatest(!nearBottom)
+  }
+
+  const scheduleActivePromptUpdate = () => {
+    const viewport = scrollRef.current
+    if (!viewport || activeUpdateFrameRef.current !== undefined) return
+    activeUpdateFrameRef.current = window.requestAnimationFrame(() => {
+      activeUpdateFrameRef.current = undefined
+      const activeId = findActivePromptId(
+        promptOffsetsRef.current,
+        viewport.scrollTop,
+        viewport.clientHeight,
+        viewport.scrollHeight,
+      )
+      if (activeId) setActivePromptId((current) => current === activeId ? current : activeId)
+    })
+  }
+
+  const handleScroll = () => {
+    updatePinnedState()
+    scheduleActivePromptUpdate()
+  }
+
+  const jumpToPrompt = (messageId: string) => {
+    pinnedToBottomRef.current = false
+    setShowJumpToLatest(true)
+    setActivePromptId(messageId)
+    const messageIndex = messages.findIndex((message) => message.id === messageId)
+    if (messageIndex < 0) return
+    if (messageIndex < firstRenderedMessageIndex) {
+      pendingPromptJumpRef.current = messageId
+      setHistoryWindow({ sessionId, limit: messages.length - messageIndex })
+      return
+    }
+    document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: 'auto', block: 'start' })
+  }
+
+  const revealEarlierMessages = () => {
+    const viewport = scrollRef.current
+    if (viewport) pendingHistoryRestoreRef.current = { scrollHeight: viewport.scrollHeight, scrollTop: viewport.scrollTop }
+    pinnedToBottomRef.current = false
+    setShowJumpToLatest(true)
+    setHistoryWindow({ sessionId, limit: Math.min(messages.length, renderedMessageLimit + MESSAGE_RENDER_BATCH) })
+  }
+
+  const cancelNavigatorHide = () => {
+    if (navigatorHideTimerRef.current === undefined) return
+    window.clearTimeout(navigatorHideTimerRef.current)
+    navigatorHideTimerRef.current = undefined
+  }
+
+  const scheduleNavigatorHide = () => {
+    cancelNavigatorHide()
+    navigatorHideTimerRef.current = window.setTimeout(() => {
+      navigatorHideTimerRef.current = undefined
+      setHighlightedPromptId(undefined)
+    }, NAVIGATOR_HIDE_DELAY)
+  }
+
+  const highlightPromptAt = (clientY: number, rail: HTMLElement) => {
+    const bounds = rail.getBoundingClientRect()
+    const ratio = Math.max(0, Math.min(1, (clientY - bounds.top) / Math.max(1, bounds.height)))
+    const prompt = userMessages[Math.round(ratio * (userMessages.length - 1))]
+    if (prompt) setHighlightedPromptId((current) => current === prompt.id ? current : prompt.id)
   }
 
   const jumpToLatest = () => {
@@ -288,8 +416,24 @@ export function ChatTimeline() {
     if (!viewport) return
     pinnedToBottomRef.current = true
     setShowJumpToLatest(false)
-    viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
+    viewport.scrollTo({ top: viewport.scrollHeight })
   }
+
+  useLayoutEffect(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    const pendingPrompt = pendingPromptJumpRef.current
+    if (pendingPrompt) {
+      pendingPromptJumpRef.current = undefined
+      pendingHistoryRestoreRef.current = undefined
+      document.getElementById(`message-${pendingPrompt}`)?.scrollIntoView({ behavior: 'auto', block: 'start' })
+      return
+    }
+    const restore = pendingHistoryRestoreRef.current
+    if (!restore) return
+    pendingHistoryRestoreRef.current = undefined
+    viewport.scrollTop = restore.scrollTop + viewport.scrollHeight - restore.scrollHeight
+  }, [renderedMessageLimit, sessionId])
 
   useEffect(() => {
     pinnedToBottomRef.current = true
@@ -300,28 +444,59 @@ export function ChatTimeline() {
     const viewport = scrollRef.current
     const content = contentRef.current
     if (!viewport || !content || typeof ResizeObserver === 'undefined') return
+    let resizeFrame: number | undefined
+    const refreshPromptOffsets = () => {
+      if (resizeFrame !== undefined) window.cancelAnimationFrame(resizeFrame)
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = undefined
+        if (pinnedToBottomRef.current) viewport.scrollTo({ top: viewport.scrollHeight })
+        const viewportTop = viewport.getBoundingClientRect().top
+        promptOffsetsRef.current = [...content.querySelectorAll<HTMLElement>('[data-prompt-id]')].flatMap((element) => {
+          const id = element.dataset.promptId
+          return id ? [{ id, top: element.getBoundingClientRect().top - viewportTop + viewport.scrollTop }] : []
+        })
+        const activeId = findActivePromptId(promptOffsetsRef.current, viewport.scrollTop, viewport.clientHeight, viewport.scrollHeight)
+        if (activeId) setActivePromptId((current) => current === activeId ? current : activeId)
+      })
+    }
     const observer = new ResizeObserver(() => {
-      if (pinnedToBottomRef.current) viewport.scrollTo({ top: viewport.scrollHeight })
+      refreshPromptOffsets()
     })
     observer.observe(content)
-    return () => observer.disconnect()
+    refreshPromptOffsets()
+    return () => {
+      observer.disconnect()
+      if (resizeFrame !== undefined) window.cancelAnimationFrame(resizeFrame)
+    }
+  }, [renderedMessageLimit, sessionId])
+
+  useEffect(() => () => {
+    if (activeUpdateFrameRef.current !== undefined) window.cancelAnimationFrame(activeUpdateFrameRef.current)
+    if (navigatorHideTimerRef.current !== undefined) window.clearTimeout(navigatorHideTimerRef.current)
   }, [])
 
   useEffect(() => {
     const viewport = scrollRef.current
     if (!viewport || !pinnedToBottomRef.current) return
-    viewport.scrollTo({ top: viewport.scrollHeight, behavior: lastMessage?.status === 'streaming' ? 'auto' : 'smooth' })
+    viewport.scrollTo({ top: viewport.scrollHeight })
   }, [lastActivitySize, lastMessage?.status, messages.length])
 
   return (
     <div className="timeline-stage">
-      <div className="timeline-scroll" ref={scrollRef} onScroll={updatePinnedState}>
+      <div className="timeline-scroll" ref={scrollRef} onScroll={handleScroll}>
         <div className="timeline-inner" ref={contentRef}>
           {messages.length ? (
             <>
               <h1 className="sr-only">{sessionName || '新任务'}</h1>
               <div className="conversation-list">
-                {messages.map((message) => <ConversationMessage key={message.id} message={message} />)}
+                {firstRenderedMessageIndex ? (
+                  <button className="load-earlier-messages" type="button" onClick={revealEarlierMessages}>
+                    显示更早的 {Math.min(MESSAGE_RENDER_BATCH, firstRenderedMessageIndex)} 条消息
+                  </button>
+                ) : null}
+                {visibleMessages.map((message) => (
+                  <ConversationMessage key={message.id} message={message} onPreviewImage={showImage} onRetry={retryMessage} />
+                ))}
               </div>
             </>
           ) : (
@@ -338,7 +513,98 @@ export function ChatTimeline() {
           )}
         </div>
       </div>
+      {userMessages.length >= 2 ? (
+        <aside
+          className="conversation-outline"
+          aria-label="对话预览"
+          onPointerEnter={cancelNavigatorHide}
+          onPointerLeave={scheduleNavigatorHide}
+          onFocusCapture={cancelNavigatorHide}
+          onBlurCapture={scheduleNavigatorHide}
+        >
+          {highlightedPromptIndex >= 0 ? (
+            <nav className="conversation-outline-panel" aria-label="用户发言索引">
+              {previewMessages.map((message) => {
+                const index = userMessages.findIndex((candidate) => candidate.id === message.id)
+                return (
+                  <button
+                    key={message.id}
+                    type="button"
+                    data-active={currentPromptId === message.id || undefined}
+                    aria-current={currentPromptId === message.id ? 'location' : undefined}
+                    aria-label={`跳转到第 ${index + 1} 条用户发言`}
+                    title={message.content}
+                    onClick={() => {
+                      jumpToPrompt(message.id)
+                      setHighlightedPromptId(undefined)
+                    }}
+                  >
+                    {message.content.replaceAll(/\s+/g, ' ').trim()}
+                  </button>
+                )
+              })}
+            </nav>
+          ) : null}
+          <button
+            className="conversation-outline-rail"
+            type="button"
+            aria-label={`对话预览，第 ${currentPromptIndex + 1} 条，共 ${userMessages.length} 条`}
+            aria-expanded={highlightedPromptIndex >= 0}
+            title="悬停预览，点击跳转"
+            style={{ height: Math.min(360, Math.max(72, userMessages.length * 12)) }}
+            onFocus={() => setHighlightedPromptId(currentPromptId)}
+            onPointerMove={(event) => highlightPromptAt(event.clientY, event.currentTarget)}
+            onClick={() => {
+              const target = highlightedPromptId ?? currentPromptId
+              if (target) jumpToPrompt(target)
+            }}
+            onKeyDown={(event) => {
+              let nextIndex = highlightedPromptIndex >= 0 ? highlightedPromptIndex : currentPromptIndex
+              if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') nextIndex -= 1
+              else if (event.key === 'ArrowDown' || event.key === 'ArrowRight') nextIndex += 1
+              else if (event.key === 'Home') nextIndex = 0
+              else if (event.key === 'End') nextIndex = userMessages.length - 1
+              else return
+              event.preventDefault()
+              setHighlightedPromptId(userMessages[Math.max(0, Math.min(userMessages.length - 1, nextIndex))]?.id)
+            }}
+          >
+            {tickIndexes.map((index) => {
+              const focusIndex = highlightedPromptIndex >= 0 ? highlightedPromptIndex : currentPromptIndex
+              const promptStep = Math.max(1, (userMessages.length - 1) / Math.max(1, tickIndexes.length - 1))
+              const distance = Math.abs(index - focusIndex) / promptStep
+              const width = distance < 0.75 ? 20 : distance < 1.75 ? 14 : 10
+              return (
+                <span
+                  key={userMessages[index].id}
+                  className="conversation-outline-tick"
+                  style={{ top: `${index / (userMessages.length - 1) * 100}%` }}
+                >
+                  <i style={{ width }} />
+                </span>
+              )
+            })}
+            <span
+              className="conversation-outline-position"
+              style={{ top: `${currentPromptIndex / (userMessages.length - 1) * 100}%` }}
+            />
+          </button>
+        </aside>
+      ) : null}
       {showJumpToLatest ? <button className="jump-to-latest" type="button" onClick={jumpToLatest}><ArrowDown size={15} />回到最新消息</button> : null}
+      <Dialog.Root open={Boolean(previewImage)} onOpenChange={(open) => { if (!open) setPreviewImage(undefined) }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="image-lightbox" aria-describedby={undefined}>
+            <Dialog.Title className="sr-only">图片预览</Dialog.Title>
+            {previewImage ? <img src={`data:${previewImage.mimeType};base64,${previewImage.data}`} alt={previewImage.name} /> : null}
+            <div className="image-lightbox-bar">
+              <span>{previewImage?.name}</span>
+              <Dialog.Close asChild><button type="button" aria-label="关闭图片预览"><X size={18} /></button></Dialog.Close>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   )
 }

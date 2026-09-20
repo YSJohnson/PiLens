@@ -9,12 +9,14 @@ interface PersistedSettings {
   modelKey?: string
   thinkingLevel?: string
   providerKeys?: Record<string, string>
+  archivedSessions?: string[]
 }
 
 const EMPTY_SETTINGS: PersistedSettings = {
   recentProjects: [],
   providerKeys: {},
   lastSessions: {},
+  archivedSessions: [],
 }
 
 export class SettingsStore {
@@ -31,6 +33,7 @@ export class SettingsStore {
         recentProjects: Array.isArray(parsed.recentProjects) ? parsed.recentProjects : [],
         providerKeys: parsed.providerKeys ?? {},
         lastSessions: parsed.lastSessions ?? {},
+        archivedSessions: Array.isArray(parsed.archivedSessions) ? parsed.archivedSessions : [],
       }
     } catch {
       this.data = { ...EMPTY_SETTINGS }
@@ -65,6 +68,19 @@ export class SettingsStore {
   async clearRunningSession(): Promise<void> {
     if (!this.data.interruptedRun) return
     delete this.data.interruptedRun
+    await this.persist()
+  }
+
+  isSessionArchived(sessionPath: string): boolean {
+    const key = sessionPath.replaceAll('\\', '/').toLocaleLowerCase()
+    return Boolean(this.data.archivedSessions?.some((item) => item.replaceAll('\\', '/').toLocaleLowerCase() === key))
+  }
+
+  async setSessionArchived(sessionPath: string, archived: boolean): Promise<void> {
+    const sessions = this.data.archivedSessions ?? []
+    const key = sessionPath.replaceAll('\\', '/').toLocaleLowerCase()
+    this.data.archivedSessions = sessions.filter((item) => item.replaceAll('\\', '/').toLocaleLowerCase() !== key)
+    if (archived) this.data.archivedSessions.push(sessionPath)
     await this.persist()
   }
 

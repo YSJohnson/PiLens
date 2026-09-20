@@ -41,6 +41,7 @@ async function runGit(cwd: string, args: string[], trim = true): Promise<string>
     const { stdout } = await execFileAsync('git', args, {
       cwd,
       windowsHide: true,
+      timeout: 5_000,
       maxBuffer: 4 * 1024 * 1024,
       encoding: 'utf8',
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_LITERAL_PATHSPECS: '1' },

@@ -23,6 +23,39 @@ describe('desktop event session status', () => {
     expect(stopped.sessions?.[0]).toEqual(expect.objectContaining({ id: 'active', streaming: false }))
   })
 
+  it('tracks a background session without replacing the visible conversation state', () => {
+    const state = {
+      ...useAppStore.getState(),
+      sessionId: 'active',
+      streaming: false,
+      sessions: [
+        { id: 'active', path: 'active.jsonl', title: 'Active', projectPath: 'C:\\project-a', createdAt: 1, updatedAt: 2, messageCount: 2, active: true },
+        { id: 'background', path: 'background.jsonl', title: 'Background', projectPath: 'C:\\project-b', createdAt: 1, updatedAt: 3, messageCount: 2 },
+      ],
+    }
+
+    const patch = reduceDesktopEvent(state, {
+      type: 'session:status',
+      sessionId: 'background',
+      sessionFile: 'background.jsonl',
+      projectPath: 'C:\\project-b',
+      streaming: true,
+    })
+
+    expect(patch.streaming).toBe(false)
+    expect(patch.sessions?.[0]).toEqual(state.sessions[0])
+    expect(patch.sessions?.[1]).toEqual(expect.objectContaining({ id: 'background', streaming: true }))
+  })
+
+  it('keeps a failed prompt in place so it can be retried', () => {
+    const prompt = { id: 'local-1', role: 'user' as const, content: '继续修复', timestamp: 1, status: 'complete' as const }
+    const state = { ...useAppStore.getState(), messages: [prompt] }
+    const patch = reduceDesktopEvent(state, { type: 'prompt:failed', promptId: prompt.id, message: '网络不可用' })
+
+    expect(patch.messages).toEqual([{ ...prompt, status: 'error', error: '网络不可用' }])
+    expect(patch.toasts?.at(-1)).toEqual(expect.objectContaining({ title: '消息发送失败', message: '网络不可用' }))
+  })
+
   it('coalesces streamed deltas and keeps only the newest tool output', () => {
     const tool = { id: 'tool-1', name: 'bash', label: 'Bash', status: 'running' as const, args: {}, output: '' }
     const streaming = { id: 'a1', role: 'assistant' as const, content: 'Hello', timestamp: 1, status: 'streaming' as const, toolRuns: [{ ...tool }] }

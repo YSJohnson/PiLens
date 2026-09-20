@@ -20,6 +20,7 @@ import type {
   CustomModelConfig,
   CompactionState,
   ModelOption,
+  PromptImage,
   ProviderOption,
   ResourceCatalog,
   ResourceKind,
@@ -32,6 +33,8 @@ import type {
   ToolRun,
   UiMessage,
 } from '../src/shared/contracts'
+import { promptImageError } from '../src/shared/prompt-images'
+import { friendlyPromptError } from '../src/shared/prompt-error'
 import { normalizeGeneratedSessionTitle, provisionalSessionTitle } from '../src/shared/session-title'
 import { getTopLevelResourcePattern, updatePackageResourcePatterns, updateTopLevelResourcePatterns } from './resource-config'
 import type { SettingsStore } from './settings-store'
@@ -95,6 +98,16 @@ function contentToText(content: unknown): string {
       return []
     })
     .join('\n')
+}
+
+function contentToImages(content: unknown, prefix: string): PromptImage[] {
+  if (!Array.isArray(content)) return []
+  return content.flatMap((item, index) => {
+    if (!item || typeof item !== 'object') return []
+    const block = item as Record<string, unknown>
+    if (block.type !== 'image' || typeof block.data !== 'string' || typeof block.mimeType !== 'string') return []
+    return [{ id: `${prefix}-image-${index}`, name: `图片 ${index + 1}`, mimeType: block.mimeType, data: block.data }]
+  })
 }
 
 function resultToText(result: unknown): string {
@@ -191,12 +204,14 @@ function serializeMessages(messages: readonly any[], runMetadata: readonly Assis
     const id = `persisted-${timestamp}-${index}`
 
     if (message?.role === 'user') {
+      const images = contentToImages(message.content, id)
       rendered.push({
         id,
         role: 'user',
         content: contentToText(message.content),
         timestamp,
         status: 'complete',
+        images: images.length ? images : undefined,
       })
       return
     }
@@ -288,8 +303,16 @@ export class PiService {
     return this.session?.sessionFile
   }
 
+  get sessionId(): string | undefined {
+    return this.session?.sessionId
+  }
+
   get isStreaming(): boolean {
     return this.session?.isStreaming ?? false
+  }
+
+  get sessionName(): string | undefined {
+    return this.session?.sessionName
   }
 
   async initialize(): Promise<void> {
@@ -346,6 +369,7 @@ export class PiService {
           providerName: providerNames.get(model.provider) ?? model.provider,
           authenticated: available.has(modelKey(model.provider, model.id)) || runtime.hasConfiguredAuth(model.provider),
           reasoning: model.reasoning,
+          imageInput: model.input.includes('image'),
           thinkingLevels: levels,
           contextWindow: model.contextWindow,
           maxTokens: model.maxTokens,
@@ -768,9 +792,28 @@ export class PiService {
     else await this.createSession(cwd)
   }
 
-  async sendPrompt(text: string, behavior?: 'steer' | 'followUp', autoNamingMode: AutoNamingMode = 'smart'): Promise<void> {
+  async listSessions(cwd: string): Promise<SessionSummary[]> {
+    return (await SessionManager.list(cwd)).map((info) => ({
+      id: info.id,
+      path: info.path,
+      title: sessionTitle(info),
+      projectPath: info.cwd,
+      createdAt: info.created.getTime(),
+      updatedAt: info.modified.getTime(),
+      messageCount: info.messageCount,
+    }))
+  }
+
+  async sendPrompt(text: string, behavior?: 'steer' | 'followUp', autoNamingMode: AutoNamingMode = 'smart', images: PromptImage[] = [], promptId?: string): Promise<void> {
     const session = this.requireSession()
-    const prompt = text.trim()
+    const validationError = promptImageError(images)
+    if (validationError) throw new Error(validationError)
+    const promptImages = images.map((image) => {
+      const data = Buffer.from(image.data, 'base64')
+      if (!data.length) throw new Error('图片内容为空。')
+      return { type: 'image' as const, data: data.toString('base64'), mimeType: image.mimeType }
+    })
+    const prompt = text.trim() || (promptImages.length ? '请查看附带的图片。' : '')
     if (!prompt) return
 
     if (!session.sessionName && autoNamingMode !== 'off') {
@@ -782,13 +825,14 @@ export class PiService {
     }
 
     void session
-      .prompt(prompt, session.isStreaming ? { streamingBehavior: behavior ?? 'followUp' } : undefined)
+      .prompt(prompt, {
+        images: promptImages.length ? promptImages : undefined,
+        streamingBehavior: session.isStreaming ? behavior ?? 'followUp' : undefined,
+      })
       .catch((error: unknown) => {
-        this.emit({
-          type: 'app:error',
-          title: 'Pi 无法完成请求',
-          message: error instanceof Error ? error.message : String(error),
-        })
+        const message = friendlyPromptError(error)
+        if (promptId) this.emit({ type: 'prompt:failed', promptId, message })
+        else this.emit({ type: 'app:error', title: 'Pi 无法完成请求', message })
         this.emit({ type: 'agent:status', streaming: false })
         this.onSettled()
       })
@@ -872,7 +916,7 @@ export class PiService {
       }
     }
 
-    const [sessions, stats] = await Promise.all([SessionManager.list(this.cwd), Promise.resolve(session.getSessionStats())])
+    const [sessions, stats] = await Promise.all([this.listSessions(this.cwd), Promise.resolve(session.getSessionStats())])
     const context = stats.contextUsage
     const activeEntryIds = new Set(session.sessionManager.getBranch().map((entry) => entry.id))
     const forkPoints = session.getUserMessagesForForking()
@@ -888,13 +932,7 @@ export class PiService {
       sessionName: session.sessionName,
       messages: serializeMessages(session.messages, assistantRunMetadata(session.sessionManager.getBranch())),
       sessions: sessions.map((info) => ({
-        id: info.id,
-        path: info.path,
-        title: sessionTitle(info),
-        projectPath: info.cwd,
-        createdAt: info.created.getTime(),
-        updatedAt: info.modified.getTime(),
-        messageCount: info.messageCount,
+        ...info,
         active: info.path === session.sessionFile,
         streaming: info.path === session.sessionFile && session.isStreaming,
       })),

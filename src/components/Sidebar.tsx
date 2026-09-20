@@ -1,4 +1,6 @@
 import {
+  Archive,
+  ArchiveRestore,
   ChevronDown,
   FolderGit2,
   FolderPlus,
@@ -6,11 +8,13 @@ import {
   LoaderCircle,
   Menu,
   MessageCircle,
+  MoreHorizontal,
   Plus,
   RefreshCw,
   Search,
   Settings2,
   SlidersHorizontal,
+  Trash2,
   X,
 } from 'lucide-react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
@@ -24,27 +28,29 @@ interface SidebarProps {
   onOpenSettings: () => void
 }
 
-function isToday(timestamp: number): boolean {
-  const date = new Date(timestamp)
-  const today = new Date()
-  return date.toDateString() === today.toDateString()
+function samePath(left: string, right: string): boolean {
+  return left.replaceAll('\\', '/').toLocaleLowerCase() === right.replaceAll('\\', '/').toLocaleLowerCase()
 }
 
 export function Sidebar({ onClose, onOpenSettings }: SidebarProps) {
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
+  const [showArchived, setShowArchived] = useState(false)
   const project = useAppStore((state) => state.project)
   const sessions = useAppStore((state) => state.sessions)
   const recentProjects = useAppStore((state) => state.recentProjects)
   const worktrees = useAppStore((state) => state.worktrees)
-  const streaming = useAppStore((state) => state.streaming)
   const createSession = useAppStore((state) => state.createSession)
   const openSession = useAppStore((state) => state.openSession)
+  const setSessionArchived = useAppStore((state) => state.setSessionArchived)
+  const deleteSession = useAppStore((state) => state.deleteSession)
   const openProject = useAppStore((state) => state.openProject)
   const chooseProject = useAppStore((state) => state.chooseProject)
   const refreshWorkspace = useAppStore((state) => state.refreshWorkspace)
   const demoMode = useAppStore((state) => state.demoMode)
   const version = useAppStore((state) => state.version)
+  const archivedCount = sessions.filter((session) => session.archived).length
+  const showingArchived = showArchived && archivedCount > 0
 
   useEffect(() => {
     const focusSearch = () => {
@@ -55,14 +61,20 @@ export function Sidebar({ onClose, onOpenSettings }: SidebarProps) {
     return () => window.removeEventListener('pi:focus-session-search', focusSearch)
   }, [])
 
-  const groupedSessions = useMemo(() => {
+  const projectGroups = useMemo(() => {
     const query = search.trim().toLocaleLowerCase()
-    const visible = sessions.filter((session) => session.title.toLocaleLowerCase().includes(query))
-    return {
-      today: visible.filter((session) => isToday(session.updatedAt)),
-      earlier: visible.filter((session) => !isToday(session.updatedAt)),
-    }
-  }, [search, sessions])
+    const projects = [...(project ? [project] : []), ...recentProjects]
+      .filter((item, index, all) => all.findIndex((candidate) => samePath(candidate.path, item.path)) === index)
+    return projects.flatMap((item) => {
+      const projectMatches = item.name.toLocaleLowerCase().includes(query) || item.path.toLocaleLowerCase().includes(query)
+      const projectSessions = sessions
+        .filter((session) => samePath(session.projectPath, item.path))
+        .filter((session) => showingArchived ? session.archived : !session.archived)
+        .filter((session) => !query || projectMatches || session.title.toLocaleLowerCase().includes(query))
+        .toSorted((left, right) => right.updatedAt - left.updatedAt)
+      return query && !projectMatches && !projectSessions.length ? [] : [{ project: item, sessions: projectSessions }]
+    })
+  }, [project, recentProjects, search, sessions, showingArchived])
 
   return (
     <aside className="task-sidebar">
@@ -76,13 +88,13 @@ export function Sidebar({ onClose, onOpenSettings }: SidebarProps) {
       </div>
 
       <div className="sidebar-controls">
-        <button className="new-task-button" type="button" disabled={streaming} title={streaming ? 'Pi 完成当前回复后可新建会话' : undefined} onClick={() => void createSession()}>
+        <button className="new-task-button" type="button" onClick={() => void createSession(project?.path)}>
           <Plus size={18} strokeWidth={1.8} />
           <span>新建会话</span>
         </button>
 
         <div className="sidebar-tool-row" aria-label="会话工具">
-          <button type="button" disabled={streaming} title={streaming ? 'Pi 完成当前回复后可切换项目' : undefined} onClick={() => void chooseProject()} aria-label="添加项目"><FolderPlus size={17} /></button>
+          <button type="button" onClick={() => void chooseProject()} aria-label="添加项目"><FolderPlus size={17} /></button>
           <button type="button" onClick={() => setSearchOpen((open) => !open)} aria-label="搜索会话" data-active={searchOpen || undefined}><Search size={17} /></button>
           <button type="button" onClick={() => project && void refreshWorkspace()} aria-label="刷新项目" title="刷新项目"><RefreshCw size={17} /></button>
           <span />
@@ -100,20 +112,33 @@ export function Sidebar({ onClose, onOpenSettings }: SidebarProps) {
       </div>
 
       <div className="session-list" aria-label="任务历史">
-        {groupedSessions.today.length ? (
-          <SessionGroup label="聊天" sessions={groupedSessions.today} appStreaming={streaming} onOpen={openSession} />
-        ) : null}
-        {groupedSessions.earlier.length ? (
-          <SessionGroup label="最近" sessions={groupedSessions.earlier} appStreaming={streaming} onOpen={openSession} />
-        ) : null}
-        {!groupedSessions.today.length && !groupedSessions.earlier.length ? (
+        {projectGroups.map((group) => (
+          <ProjectGroup
+            key={group.project.path}
+            project={group.project}
+            sessions={group.sessions}
+            active={Boolean(project && samePath(group.project.path, project.path))}
+            onCreate={createSession}
+            onOpenProject={openProject}
+            onOpenSession={openSession}
+            onSetArchived={setSessionArchived}
+            onDelete={deleteSession}
+          />
+        ))}
+        {!projectGroups.length ? (
           <p className="empty-list">没有匹配的任务</p>
+        ) : null}
+        {archivedCount ? (
+          <button className="archived-toggle" type="button" data-active={showingArchived || undefined} onClick={() => setShowArchived((visible) => !visible)}>
+            {showingArchived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+            {showingArchived ? '返回全部会话' : `已归档 ${archivedCount}`}
+          </button>
         ) : null}
       </div>
 
       <DropdownMenu.Root>
         <DropdownMenu.Trigger asChild>
-          <button className="project-trigger" type="button" disabled={streaming} title={streaming ? 'Pi 完成当前回复后可切换 worktree' : undefined}>
+          <button className="project-trigger" type="button">
             <FolderGit2 size={16} strokeWidth={1.7} />
             <span><strong>{project?.name ?? '选择项目'}</strong><small>{project?.branch ?? project?.path}</small></span>
             <ChevronDown size={14} />
@@ -129,7 +154,6 @@ export function Sidebar({ onClose, onOpenSettings }: SidebarProps) {
                     key={item.path}
                     className="dropdown-item project-menu-item"
                     data-current={item.current || undefined}
-                    disabled={streaming && !item.current}
                     onSelect={() => { if (!item.current) void openProject(item.path) }}
                   >
                     <GitBranch size={15} />
@@ -140,15 +164,7 @@ export function Sidebar({ onClose, onOpenSettings }: SidebarProps) {
                 <DropdownMenu.Separator className="dropdown-separator" />
               </>
             ) : null}
-            <DropdownMenu.Label className="dropdown-label">最近的项目</DropdownMenu.Label>
-            {recentProjects.map((item) => (
-              <DropdownMenu.Item key={item.path} className="dropdown-item project-menu-item" disabled={streaming} onSelect={() => void openProject(item.path)}>
-                <FolderGit2 size={15} />
-                <span><strong>{item.name}</strong><small>{item.path}</small></span>
-              </DropdownMenu.Item>
-            ))}
-            <DropdownMenu.Separator className="dropdown-separator" />
-            <DropdownMenu.Item className="dropdown-item" disabled={streaming} onSelect={() => void chooseProject()}><Plus size={15} /> 打开其他文件夹…</DropdownMenu.Item>
+            <DropdownMenu.Item className="dropdown-item" onSelect={() => void chooseProject()}><Plus size={15} /> 打开其他文件夹…</DropdownMenu.Item>
           </DropdownMenu.Content>
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
@@ -161,39 +177,69 @@ export function Sidebar({ onClose, onOpenSettings }: SidebarProps) {
   )
 }
 
-interface SessionGroupProps {
-  label: string
+interface ProjectGroupProps {
+  project: NonNullable<ReturnType<typeof useAppStore.getState>['project']>
   sessions: ReturnType<typeof useAppStore.getState>['sessions']
-  appStreaming: boolean
-  onOpen: (path: string) => Promise<void>
+  active: boolean
+  onCreate: (projectPath?: string) => Promise<void>
+  onOpenProject: (path: string) => Promise<void>
+  onOpenSession: (path: string, projectPath?: string) => Promise<void>
+  onSetArchived: (path: string, projectPath: string, archived: boolean) => Promise<void>
+  onDelete: (path: string, projectPath: string) => Promise<void>
 }
 
-function SessionGroup({ label, sessions, appStreaming, onOpen }: SessionGroupProps) {
+function ProjectGroup({ project, sessions, active, onCreate, onOpenProject, onOpenSession, onSetArchived, onDelete }: ProjectGroupProps) {
+  const running = sessions.filter((session) => session.streaming).length
   return (
-    <section className="session-group">
-      <h2>{label}</h2>
+    <section className="project-group" data-active={active || undefined}>
+      <div className="project-group-heading">
+        <button type="button" className="project-group-open" onClick={() => { if (!active) void onOpenProject(project.path) }}>
+          <FolderGit2 size={15} />
+          <span><strong>{project.name}</strong><small>{project.branch ?? project.path}</small></span>
+          {running ? <i title={`${running} 个会话运行中`}><LoaderCircle className="spin" size={12} />{running}</i> : null}
+        </button>
+        <button type="button" className="project-group-new" onClick={() => void onCreate(project.path)} aria-label={`在 ${project.name} 新建会话`} title="新建会话"><Plus size={14} /></button>
+      </div>
       <div>
-        {sessions.map((session) => {
-          const switchBlocked = appStreaming && !session.active
-          return (
+        {sessions.map((session) => (
+          <div className="session-row-shell" key={session.id}>
             <button
               type="button"
-              key={session.id}
               className="session-row"
               data-active={session.active || undefined}
               data-streaming={session.streaming || undefined}
               aria-current={session.active ? 'true' : undefined}
               aria-label={`${session.title}，${session.streaming ? '运行中' : formatRelativeTime(session.updatedAt)}`}
-              disabled={switchBlocked}
-              title={switchBlocked ? 'Pi 完成当前回复后可切换会话' : undefined}
-              onClick={() => { if (!session.active) void onOpen(session.path) }}
+              onClick={() => { if (!session.active) void onOpenSession(session.path, session.projectPath) }}
             >
               <MessageCircle size={15} strokeWidth={1.6} />
               <span className="session-title">{session.title}</span>
               <span className="session-meta">{session.streaming ? <span className="session-running-label"><LoaderCircle className="spin" size={12} />运行中</span> : formatRelativeTime(session.updatedAt)}</span>
             </button>
-          )
-        })}
+            <DropdownMenu.Root>
+              <DropdownMenu.Trigger asChild>
+                <button className="session-more" type="button" aria-label={`${session.title} 的更多操作`} disabled={session.streaming}><MoreHorizontal size={15} /></button>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal>
+                <DropdownMenu.Content className="dropdown-content session-menu" sideOffset={4} align="end">
+                  <DropdownMenu.Item className="dropdown-item" onSelect={() => void onSetArchived(session.path, session.projectPath, !session.archived)}>
+                    {session.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+                    {session.archived ? '恢复会话' : '归档会话'}
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item
+                    className="dropdown-item danger"
+                    onSelect={() => {
+                      if (window.confirm(`确定删除“${session.title}”吗？会话文件会移到 Windows 回收站。`)) void onDelete(session.path, session.projectPath)
+                    }}
+                  >
+                    <Trash2 size={14} />删除会话
+                  </DropdownMenu.Item>
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
+          </div>
+        ))}
+        {!sessions.length ? <p className="project-empty">尚无会话</p> : null}
       </div>
     </section>
   )

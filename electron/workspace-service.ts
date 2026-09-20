@@ -32,6 +32,7 @@ async function runGit(cwd: string, args: string[]): Promise<string> {
     const { stdout } = await execFileAsync('git', args, {
       cwd,
       windowsHide: true,
+      timeout: 5_000,
       maxBuffer: 4 * 1024 * 1024,
       encoding: 'utf8',
     })
@@ -138,10 +139,10 @@ export class WorkspaceService {
     })
   }
 
-  async snapshot(): Promise<{ project: ProjectInfo; changes: FileChange[]; files: FileNode[]; worktrees: WorktreeInfo[] }> {
+  async snapshot(knownProject?: ProjectInfo): Promise<{ project: ProjectInfo; changes: FileChange[]; files: FileNode[]; worktrees: WorktreeInfo[] }> {
     const currentPath = this.requirePath()
     const [project, changes, files, worktrees] = await Promise.all([
-      this.describe(currentPath),
+      knownProject ?? this.describe(currentPath),
       this.getChanges(currentPath),
       this.getFileTree(currentPath),
       this.getWorktrees(currentPath),
