@@ -18,7 +18,7 @@ import {
   X,
 } from 'lucide-react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { formatRelativeTime } from '../lib/format'
 import { useAppStore } from '../store/use-app-store'
 import { PiMark } from './PiMark'
@@ -189,19 +189,31 @@ interface ProjectGroupProps {
 }
 
 function ProjectGroup({ project, sessions, active, onCreate, onOpenProject, onOpenSession, onSetArchived, onDelete }: ProjectGroupProps) {
+  const [collapsed, setCollapsed] = useState(false)
+  const [showAll, setShowAll] = useState(false)
+  const sessionsId = useId()
   const running = sessions.filter((session) => session.streaming).length
+  const visibleSessions = showAll ? sessions : sessions.slice(0, 5)
   return (
     <section className="project-group" data-active={active || undefined}>
       <div className="project-group-heading">
-        <button type="button" className="project-group-open" onClick={() => { if (!active) void onOpenProject(project.path) }}>
-          <FolderGit2 size={15} />
+        <button
+          type="button"
+          className="project-group-open"
+          aria-label={`${collapsed ? '展开' : '收起'} ${project.name} 的会话`}
+          aria-expanded={!collapsed}
+          aria-controls={sessionsId}
+          onClick={() => setCollapsed((value) => !value)}
+        >
+          <ChevronDown size={15} data-collapsed={collapsed || undefined} />
           <span><strong>{project.name}</strong><small>{project.branch ?? project.path}</small></span>
           {running ? <i title={`${running} 个会话运行中`}><LoaderCircle className="spin" size={12} />{running}</i> : null}
         </button>
+        <button type="button" className="project-group-new" onClick={() => { if (!active) void onOpenProject(project.path) }} aria-label={`打开工作目录 ${project.name}`} title="打开工作目录"><FolderGit2 size={14} /></button>
         <button type="button" className="project-group-new" onClick={() => void onCreate(project.path)} aria-label={`在 ${project.name} 新建会话`} title="新建会话"><Plus size={14} /></button>
       </div>
-      <div>
-        {sessions.map((session) => (
+      <div id={sessionsId} hidden={collapsed}>
+        {visibleSessions.map((session) => (
           <div className="session-row-shell" key={session.id}>
             <button
               type="button"
@@ -239,6 +251,12 @@ function ProjectGroup({ project, sessions, active, onCreate, onOpenProject, onOp
             </DropdownMenu.Root>
           </div>
         ))}
+        {sessions.length > 5 ? (
+          <button className="project-sessions-toggle" type="button" aria-expanded={showAll} aria-controls={sessionsId} onClick={() => setShowAll((value) => !value)}>
+            <ChevronDown size={14} data-expanded={showAll || undefined} />
+            {showAll ? '收起更多会话' : `展开其余 ${sessions.length - 5} 条会话`}
+          </button>
+        ) : null}
         {!sessions.length ? <p className="project-empty">尚无会话</p> : null}
       </div>
     </section>
